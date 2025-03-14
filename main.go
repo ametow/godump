@@ -1,121 +1,94 @@
 package main
 
 import (
-	"database/sql"
+	"fmt"
 	"log"
-	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 
-	"github.com/gin-gonic/gin"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	_ "modernc.org/sqlite"
+	"github.com/spf13/cobra"
 )
 
 var (
-	packetCount = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "network_packets_total",
-			Help: "Total number of network packets captured",
-		},
-		[]string{"protocol"},
-	)
-	db *sql.DB
+	interfaceName string
+	protocol      string
+	port          int
+	follow        bool
 )
 
-func init() {
-	prometheus.MustRegister(packetCount)
-}
-
 func main() {
-	var err error
-	db, err = sql.Open("sqlite", "packets.db")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-
-	_, err = db.Exec("CREATE TABLE IF NOT EXISTS packets (id INTEGER PRIMARY KEY, src_ip TEXT, dst_ip TEXT, protocol TEXT, src_port INTEGER, dst_port INTEGER)")
-	if err != nil {
-		log.Fatal(err)
+	rootCmd := &cobra.Command{
+		Use:   "godump",
+		Short: "A simple packet capture tool like tcpdump",
+		Run:   runCapture,
 	}
 
-	go capturePackets()
+	rootCmd.Flags().StringVarP(&interfaceName, "interface", "i", "en0", "Network interface to capture on")
+	rootCmd.Flags().StringVarP(&protocol, "protocol", "P", "", "Filter by protocol (tcp/udp)")
+	rootCmd.Flags().IntVarP(&port, "port", "p", 0, "Filter by port")
+	rootCmd.Flags().BoolVarP(&follow, "follow", "f", false, "Attach to terminal and display live packets")
 
-	r := gin.Default()
-	r.GET("/api/packets", getPackets)
-	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
-
-	r.Run(":8080")
+	if err := rootCmd.Execute(); err != nil {
+		log.Fatal(err)
+	}
 }
 
-func capturePackets() {
-	handle, err := pcap.OpenLive("en0", 1600, true, pcap.BlockForever)
+func runCapture(cmd *cobra.Command, args []string) {
+	fmt.Printf("Capturing packets on interface: %s\n", interfaceName)
+
+	handle, err := pcap.OpenLive(interfaceName, 1600, true, pcap.BlockForever)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer handle.Close()
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signalChan
+		fmt.Println("\nStopping capture...")
+		handle.Close()
+		os.Exit(0)
+	}()
+
 	for packet := range packetSource.Packets() {
-		processPacket(packet)
+		if follow {
+			processPacket(packet)
+		} else {
+			go processPacket(packet)
+		}
 	}
 }
 
 func processPacket(packet gopacket.Packet) {
-	var srcIP, dstIP, protocol string
+	var srcIP, dstIP, proto string
 	var srcPort, dstPort int
 
 	if netLayer := packet.NetworkLayer(); netLayer != nil {
 		srcIPRaw, dstIPRaw := netLayer.NetworkFlow().Endpoints()
-		srcIP = srcIPRaw.String()
-		dstIP = dstIPRaw.String()
+		srcIP, dstIP = srcIPRaw.String(), dstIPRaw.String()
 	}
 
 	if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
-		tcp, _ := tcpLayer.(*layers.TCP)
-		srcPort, dstPort = int(tcp.SrcPort), int(tcp.DstPort)
-		protocol = "TCP"
+		if protocol == "tcp" || protocol == "" {
+			tcp := tcpLayer.(*layers.TCP)
+			srcPort, dstPort = int(tcp.SrcPort), int(tcp.DstPort)
+			proto = "TCP"
+		}
 	} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-		udp, _ := udpLayer.(*layers.UDP)
-		srcPort, dstPort = int(udp.SrcPort), int(udp.DstPort)
-		protocol = "UDP"
-	}
-
-	if protocol != "" {
-		packetCount.WithLabelValues(protocol).Inc()
-		_, err := db.Exec("INSERT INTO packets (src_ip, dst_ip, protocol, src_port, dst_port) VALUES (?, ?, ?, ?, ?)", srcIP, dstIP, protocol, srcPort, dstPort)
-		if err != nil {
-			log.Println("DB Insert Error:", err)
+		if protocol == "udp" || protocol == "" {
+			udp := udpLayer.(*layers.UDP)
+			srcPort, dstPort = int(udp.SrcPort), int(udp.DstPort)
+			proto = "UDP"
 		}
 	}
-}
 
-func getPackets(c *gin.Context) {
-	rows, err := db.Query("SELECT src_ip, dst_ip, protocol, src_port, dst_port FROM packets ORDER BY id DESC LIMIT 100")
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+	if proto != "" && (port == 0 || srcPort == port || dstPort == port) {
+		fmt.Printf("%s %s:%d -> %s:%d\n", proto, srcIP, srcPort, dstIP, dstPort)
 	}
-	defer rows.Close()
-
-	var packets []map[string]interface{}
-	for rows.Next() {
-		var srcIP, dstIP, protocol string
-		var srcPort, dstPort int
-		if err := rows.Scan(&srcIP, &dstIP, &protocol, &srcPort, &dstPort); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		packets = append(packets, gin.H{
-			"src_ip":   srcIP,
-			"dst_ip":   dstIP,
-			"protocol": protocol,
-			"src_port": srcPort,
-			"dst_port": dstPort,
-		})
-	}
-	c.JSON(http.StatusOK, packets)
 }
